@@ -1,0 +1,6 @@
+{
+  "question": "What is our total revenue to date?",
+  "sql": "SELECT\n  ROUND(SUM(oi.sale_price), 2) AS total_revenue,\n  COUNT(DISTINCT oi.order_id) AS orders_count\nFROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi\nWHERE oi.status NOT IN ('Cancelled', 'Returned')\nLIMIT 1",
+  "report_style_notes": "One headline number, stated first and formatted like $8.1M. Clarify that cancelled and returned items are excluded. Keep it to two or three sentences.",
+  "tables_used": ["order_items"]
+}

@@ -1,0 +1,6 @@
+{
+  "question": "What is our average order value?",
+  "sql": "WITH order_totals AS (\n  SELECT\n    oi.order_id AS order_id,\n    SUM(oi.sale_price) AS order_value\n  FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi\n  WHERE oi.status NOT IN ('Cancelled', 'Returned')\n  GROUP BY order_id\n)\nSELECT\n  ROUND(AVG(ot.order_value), 2) AS average_order_value,\n  COUNT(*) AS orders_count\nFROM order_totals AS ot\nLIMIT 1",
+  "report_style_notes": "Single headline figure in currency, with the order count it is based on. Note that the average is per order (basket), not per item — executives often conflate the two.",
+  "tables_used": ["order_items"]
+}

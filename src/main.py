@@ -39,8 +39,17 @@ def _print_node_update(node: str, update: dict[str, object]) -> None:
     """Render one streamed node update as CLI progress."""
     label = _PROGRESS.get(node, node)
     print(f"  · {node} — {label}")
-    if node == "sql_generation" and update.get("sql"):
-        print("    generated SQL:")
+    if node == "trio_retrieval":
+        trios = update.get("retrieved_trios")
+        if isinstance(trios, list) and trios:
+            for trio in trios:
+                if isinstance(trio, dict):
+                    print(f"    retrieved: {trio.get('id')} (similarity {trio.get('score')})")
+        else:
+            print("    no similar past analyses found — using schema only")
+    if node in ("sql_generation", "sql_repair") and update.get("sql"):
+        header = "repaired SQL:" if node == "sql_repair" else "generated SQL:"
+        print(f"    {header}")
         for line in str(update["sql"]).splitlines():
             print(f"      {line}")
     if update.get("sql_error"):

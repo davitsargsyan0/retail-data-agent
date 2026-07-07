@@ -1,0 +1,6 @@
+{
+  "question": "Who are our top 10 customers by total spend?",
+  "sql": "SELECT\n  u.id AS user_id,\n  u.first_name AS first_name,\n  u.last_name AS last_name,\n  ROUND(SUM(oi.sale_price), 2) AS total_spend,\n  COUNT(DISTINCT oi.order_id) AS orders_count\nFROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi\nJOIN `bigquery-public-data.thelook_ecommerce.users` AS u\n  ON oi.user_id = u.id\nWHERE oi.status NOT IN ('Cancelled', 'Returned')\nGROUP BY user_id, first_name, last_name\nORDER BY total_spend DESC\nLIMIT 10",
+  "report_style_notes": "Rank customers in a table with spend formatted as currency. Lead with who the #1 customer is and their total. Mention order counts so spend has context (many small orders vs. few large ones).",
+  "tables_used": ["order_items", "users"]
+}

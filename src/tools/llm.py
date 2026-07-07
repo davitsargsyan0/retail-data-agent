@@ -21,7 +21,9 @@ from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmb
 logger = logging.getLogger(__name__)
 
 DEFAULT_CHAT_MODEL = "gemini-2.5-flash"
-DEFAULT_EMBEDDING_MODEL = "models/text-embedding-004"
+# The architecture doc names text-embedding-004, but that model was retired
+# from the Gemini API (404s as of 2026-07); gemini-embedding-001 replaces it.
+DEFAULT_EMBEDDING_MODEL = "models/gemini-embedding-001"
 
 _MAX_ATTEMPTS = 3
 _BASE_DELAY_SECONDS = 1.0

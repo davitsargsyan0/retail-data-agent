@@ -26,6 +26,7 @@ from langgraph.graph.state import CompiledStateGraph
 from agent.state import AgentState
 from tools.bigquery_client import BigQueryClient, BigQueryClientError
 from tools.llm import LLMError, generate
+from tools.trio_retrieval import TrioRetriever
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,7 @@ SCHEMA_DOC = REPO_ROOT / "docs" / "schema.md"
 MAX_REPORT_ROWS = 20
 
 _bq = BigQueryClient()
+_retriever = TrioRetriever()
 
 _CODE_FENCE = re.compile(r"^```[a-zA-Z]*\n|\n?```$", re.MULTILINE)
 
@@ -88,8 +90,22 @@ def intent_router(state: AgentState) -> AgentState:
 
 
 def trio_retrieval(state: AgentState) -> AgentState:
-    """Retrieve golden-bucket trios. Milestone-1 stub: no trios yet."""
-    return {"retrieved_trios": []}
+    """Retrieve top-k golden-bucket trios by cosine similarity.
+
+    Degrades, never blocks: on any retrieval failure the agent falls back to
+    schema-only SQL generation (architecture §5.5).
+    """
+    question = _last_user_question(state)
+    try:
+        trios = _retriever.retrieve(question)
+    except Exception as exc:  # noqa: BLE001 — degradation path, never fatal
+        logger.warning("trio retrieval degraded to schema-only generation: %s", exc)
+        return {"retrieved_trios": []}
+    logger.info(
+        "trio_retrieval: %s",
+        ", ".join(f"{t['id']}={t['score']:.2f}" for t in trios) or "no match above floor",
+    )
+    return {"retrieved_trios": trios}
 
 
 def sql_generation(state: AgentState) -> AgentState:

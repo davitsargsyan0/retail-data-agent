@@ -1,0 +1,6 @@
+{
+  "question": "What are our best-selling products by units sold?",
+  "sql": "SELECT\n  p.name AS product_name,\n  p.brand AS brand,\n  COUNT(*) AS units_sold,\n  ROUND(SUM(oi.sale_price), 2) AS total_revenue\nFROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi\nJOIN `bigquery-public-data.thelook_ecommerce.products` AS p\n  ON oi.product_id = p.id\nWHERE oi.status NOT IN ('Cancelled', 'Returned')\nGROUP BY product_name, brand\nORDER BY units_sold DESC\nLIMIT 20",
+  "report_style_notes": "Rank by units, include the brand, and show revenue as a secondary column. Note if best-sellers by volume differ from revenue leaders — that gap is the interesting story.",
+  "tables_used": ["order_items", "products"]
+}

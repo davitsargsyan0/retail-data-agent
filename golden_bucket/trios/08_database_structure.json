@@ -1,0 +1,6 @@
+{
+  "question": "What tables do we have in the database and what columns are in them?",
+  "sql": "SELECT\n  c.table_name AS table_name,\n  c.column_name AS column_name,\n  c.data_type AS data_type\nFROM `bigquery-public-data.thelook_ecommerce.INFORMATION_SCHEMA.COLUMNS` AS c\nWHERE c.table_name IN ('orders', 'order_items', 'products', 'users')\nORDER BY c.table_name, c.ordinal_position\nLIMIT 100",
+  "report_style_notes": "Plain-language tour, one short paragraph or bullet per table: what business entity it represents and its key columns. Skip SQL type jargon unless asked — say 'date', 'number', 'text'.",
+  "tables_used": ["orders", "order_items", "products", "users"]
+}
