@@ -18,6 +18,8 @@ dev = [
     "pytest",
     "ruff",
     "mypy",
+    "pyyaml",
+    "types-pyyaml",
 ]
 
 [build-system]
