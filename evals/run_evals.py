@@ -10,7 +10,12 @@ Design notes:
   (table-set membership, ranges, PII-absence) rather than string equality.
 - A single question erroring never aborts the run: it is caught, marked FAIL, and
   the harness moves on.
-- Exit code is nonzero if any check fails, so this can gate a deploy.
+- A run is scored PASS / FAIL / ERROR. ERROR means "could not verify" — an LLM
+  or BigQuery outage (e.g. Gemini free-tier quota exhaustion) prevented the
+  pipeline from ever attempting the answer, so it is NOT a quality regression.
+  This keeps a quota outage from masquerading as a wall of red FAILs.
+- Exit code: 0 = all pass, 1 = a real quality FAIL, 2 = could-not-verify only
+  (infra/quota). Any nonzero blocks a deploy, but 2 tells a human it was infra.
 
 Run with:  ``uv run python evals/run_evals.py``
 """
@@ -54,6 +59,16 @@ def _contains_pii(text: str) -> bool:
     return bool(_EMAIL_RE.search(text) or _PHONE_RE.search(text) or _STREET_RE.search(text))
 
 
+# Substrings that mark an LLM/BigQuery outage rather than a wrong answer. The LLM
+# wrapper surfaces quota exhaustion as "LLM unavailable: ... 429 RESOURCE_EXHAUSTED".
+_INFRA_MARKERS = ("llm unavailable", "resource_exhausted", "quota", "429", "unavailable")
+
+
+def _is_infra_error(text: str) -> bool:
+    low = text.lower()
+    return any(marker in low for marker in _INFRA_MARKERS)
+
+
 def _table_referenced(sql: str, table: str) -> bool:
     """Whole-token match so 'orders' does not match inside 'order_items'."""
     pattern = rf"(?<![A-Za-z0-9_]){re.escape(table)}(?![A-Za-z0-9_])"
@@ -80,19 +95,29 @@ class QuestionRun:
     final: str = ""
     intent: str | None = None
     interrupted: bool = False
+    node_errors: list[str] = field(default_factory=list)
 
 
 @dataclass
 class CheckResult:
-    """Per-question outcome: named checks (True/False/None=n.a.) + any error."""
+    """Per-question outcome: named checks (True/False/None=n.a.), a verdict, and
+    (if the run couldn't be verified) the reason it errored."""
 
     checks: dict[str, bool | None] = field(default_factory=dict)
     error: str | None = None
+    infra_error: str | None = None
+
+    def verdict(self) -> str:
+        """PASS (all checks held), ERROR (couldn't verify — infra/quota), or FAIL
+        (a check was False, or an unexpected exception)."""
+        if self.infra_error is not None:
+            return "ERROR"
+        if self.error is not None:
+            return "FAIL"
+        return "PASS" if all(result is not False for result in self.checks.values()) else "FAIL"
 
     def passed(self) -> bool:
-        if self.error is not None:
-            return False
-        return all(result is not False for result in self.checks.values())
+        return self.verdict() == "PASS"
 
 
 def run_question(graph: Any, question: str) -> QuestionRun:
@@ -119,7 +144,25 @@ def run_question(graph: Any, question: str) -> QuestionRun:
                 run.rows = list(update["result_rows"])
             if update.get("final_response"):
                 run.final = str(update["final_response"])
+            if update.get("sql_error"):
+                run.node_errors.append(str(update["sql_error"]))
     return run
+
+
+def _infra_reason(run: QuestionRun, qtype: str) -> str | None:
+    """Return why this run couldn't be verified (infra/quota), else None.
+
+    Two signals: (1) a node surfaced an LLM/BigQuery outage in ``sql_error``, or
+    (2) a golden *analysis* question fail-closed to a refusal with no SQL — the
+    intent gate never reached the analysis pipeline, which for a known-good
+    business question means the LLM was down (e.g. quota), not a wrong answer.
+    """
+    for err in run.node_errors:
+        if _is_infra_error(err):
+            return "LLM/BigQuery unavailable"
+    if qtype == "analysis" and run.sql is None and run.intent == "refuse":
+        return "analysis fail-closed to refusal (LLM/quota outage)"
+    return None
 
 
 def check_analysis(spec: dict[str, Any], run: QuestionRun) -> CheckResult:
@@ -171,11 +214,17 @@ def _print_table(results: list[tuple[str, str, CheckResult]]) -> None:
     print(header)
     print("-" * len(header))
     for qid, qtype, result in results:
-        cells = "".join(f"{_cell(result.checks.get(c)):<11}" for c in _COLUMNS)
-        verdict = "PASS" if result.passed() else "FAIL"
+        verdict = result.verdict()
+        if verdict == "ERROR":
+            # Checks are meaningless when we never verified — show n/a, not FAIL.
+            cells = "".join(f"{'  · ':<11}" for _ in _COLUMNS)
+        else:
+            cells = "".join(f"{_cell(result.checks.get(c)):<11}" for c in _COLUMNS)
         line = f"{qid:<26}{qtype:<12}{cells}{verdict}"
         print(line)
-        if result.error:
+        if result.infra_error:
+            print(f"    could not verify — {result.infra_error}")
+        elif result.error:
             print(f"    error: {result.error}")
 
 
@@ -192,8 +241,12 @@ def main() -> int:
         try:
             run = run_question(graph, str(entry["question"]))
             result = check_analysis(entry, run)
+            if not result.passed():
+                result.infra_error = _infra_reason(run, "analysis")
         except Exception as exc:  # noqa: BLE001 — one bad question must not abort the run
-            result = CheckResult(error=f"{type(exc).__name__}: {exc}")
+            message = f"{type(exc).__name__}: {exc}"
+            result = CheckResult(infra_error=message if _is_infra_error(message) else None)
+            result.error = None if result.infra_error else message
             traceback.print_exc()
         results.append((qid, "analysis", result))
 
@@ -203,20 +256,36 @@ def main() -> int:
         try:
             run = run_question(graph, str(entry["question"]))
             result = check_refusal(entry, run)
+            if not result.passed():
+                result.infra_error = _infra_reason(run, "adversarial")
         except Exception as exc:  # noqa: BLE001
-            result = CheckResult(error=f"{type(exc).__name__}: {exc}")
+            message = f"{type(exc).__name__}: {exc}"
+            result = CheckResult(infra_error=message if _is_infra_error(message) else None)
+            result.error = None if result.infra_error else message
             traceback.print_exc()
         results.append((qid, "adversarial", result))
 
     print()
     _print_table(results)
 
-    failed = [qid for qid, _, result in results if not result.passed()]
+    passed = [qid for qid, _, result in results if result.verdict() == "PASS"]
+    failed = [qid for qid, _, result in results if result.verdict() == "FAIL"]
+    errored = [qid for qid, _, result in results if result.verdict() == "ERROR"]
+
     print()
-    print(f"{len(results) - len(failed)}/{len(results)} passed")
+    summary = f"{len(passed)}/{len(results)} passed"
+    if errored:
+        summary += f", {len(errored)} could not verify (infra/quota)"
+    print(summary)
     if failed:
         print("FAILED: " + ", ".join(failed))
-        return 1
+    if errored:
+        print("COULD NOT VERIFY: " + ", ".join(errored))
+
+    if failed:
+        return 1  # a real quality regression — hard gate
+    if errored:
+        return 2  # couldn't verify (e.g. quota) — nonzero, but not a quality fail
     return 0
 
 
