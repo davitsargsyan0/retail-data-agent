@@ -50,6 +50,7 @@ class AgentState(TypedDict, total=False):
     persona: str
     preferences: dict[str, str]
     intent: Intent
+    intent_reason: str
     retrieved_trios: list[Trio]
     sql: str | None
     sql_error: str | None
@@ -58,6 +59,8 @@ class AgentState(TypedDict, total=False):
     result_rows: list[dict[str, object]] | None
     masked: bool
     matched_reports: list[ReportRef]
+    delete_filter: str | None
     delete_confirmed: bool | None
+    confirmation_text: str | None
     final_response: str
     trace_id: str

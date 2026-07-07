@@ -27,9 +27,11 @@ class TestRouting:
         state: AgentState = {"sql_error": "Unrecognized name: foo", "retry_count": 2}
         assert _route_after_guard(state) == "graceful_failure"
 
-    def test_execute_success_goes_to_report(self) -> None:
+    def test_execute_success_goes_to_pii_mask(self) -> None:
+        # Successful execution flows into the PII output sweep before the report
+        # is ever generated (architecture §5.2, layer 3).
         state: AgentState = {"sql_error": None, "retry_count": 1}
-        assert _route_after_execute(state) == "report_generation"
+        assert _route_after_execute(state) == "pii_mask"
 
     def test_empty_result_triggers_heal(self) -> None:
         state: AgentState = {"sql_error": "Query returned zero rows.", "retry_count": 0}
