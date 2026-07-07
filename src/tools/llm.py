@@ -31,6 +31,7 @@ DEFAULT_EMBEDDING_MODEL = "models/gemini-embedding-001"
 _MAX_ATTEMPTS = 3
 _BASE_DELAY_SECONDS = 1.0
 
+
 class LLMError(Exception):
     """Raised when the LLM provider fails after all retries."""
 

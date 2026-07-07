@@ -33,11 +33,45 @@ from typing import Any, Literal
 # Words we treat as proper-noun entities when auto-extracting from a report.
 _STOPWORDS = frozenset(
     {
-        "the", "a", "an", "and", "or", "of", "for", "to", "in", "on", "by", "with",
-        "here", "what", "who", "why", "how", "which", "these", "this", "that",
-        "i", "you", "we", "report", "reports", "analysis", "found", "total",
-        "top", "customers", "customer", "revenue", "orders", "order", "products",
-        "product", "monthly", "average",
+        "the",
+        "a",
+        "an",
+        "and",
+        "or",
+        "of",
+        "for",
+        "to",
+        "in",
+        "on",
+        "by",
+        "with",
+        "here",
+        "what",
+        "who",
+        "why",
+        "how",
+        "which",
+        "these",
+        "this",
+        "that",
+        "i",
+        "you",
+        "we",
+        "report",
+        "reports",
+        "analysis",
+        "found",
+        "total",
+        "top",
+        "customers",
+        "customer",
+        "revenue",
+        "orders",
+        "order",
+        "products",
+        "product",
+        "monthly",
+        "average",
     }
 )
 
@@ -225,11 +259,7 @@ class ReportStore:
 
     def match_by_date(self, owner: str, day: date) -> list[Report]:
         """Owner's reports created on ``day`` (UTC)."""
-        return [
-            report
-            for report in self.list_for_owner(owner)
-            if _created_date(report) == day
-        ]
+        return [report for report in self.list_for_owner(owner) if _created_date(report) == day]
 
     def resolve(self, owner: str, request: DeleteRequest) -> list[Report]:
         """Resolve a parsed delete request into a concrete, owner-scoped set."""

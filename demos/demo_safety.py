@@ -4,7 +4,8 @@ This drives the **real compiled LangGraph** end to end. Only two boundaries are
 stubbed so the demo is deterministic and needs no network — and both are marked
 ``[stub]`` in the transcript:
 
-- the **LLM** (intent classification for the ambiguous case, SQL generation), and
+- the **LLM** (intent classification for the ambiguous case, SQL generation,
+  and the report's executive summary), and
 - **BigQuery** (dry-run + execute).
 
 Everything being showcased is the genuine production code path: the intent
@@ -68,6 +69,22 @@ _CANNED_SQL = (
     "JOIN `bigquery-public-data.thelook_ecommerce.users` AS u ON oi.user_id = u.id\n"
     "GROUP BY u.first_name, u.account_note\nORDER BY lifetime_spend DESC"
 )
+
+# Canned persona-toned executive summary for the report-narrative LLM call.
+_CANNED_SUMMARY = (
+    "Jane is your top customer at $4,820.50 lifetime spend, ahead of Raj at "
+    "$3,115.00 — together just under $8K. Contact details are excluded from "
+    "this view."
+)
+
+
+def _fake_generate(system: str, user: str) -> str:
+    """Stub LLM: SQL for the generation/repair prompts, a canned executive
+    summary for the report-narrative call (whose system prompt is the hot-loaded
+    persona, not a SQL instruction)."""
+    if "SELECT" in system:  # sql_generation / sql_repair system prompts
+        return _CANNED_SQL
+    return _CANNED_SUMMARY
 
 
 def _banner(title: str) -> None:
@@ -189,7 +206,7 @@ def main() -> int:
     graph_module._store = ReportStore(demo_root / "scratch")
     graph_module._bq = _FakeBigQuery()  # type: ignore[assignment]
     graph_module._retriever.retrieve = lambda question: []  # type: ignore[assignment,return-value]
-    graph_module.generate = lambda system, user: _CANNED_SQL  # type: ignore[assignment]
+    graph_module.generate = _fake_generate  # type: ignore[assignment]
     intent_gate.generate = lambda system, user: "analysis"  # type: ignore[assignment]
 
     graph = graph_module.build_graph()

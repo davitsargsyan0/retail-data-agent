@@ -28,11 +28,7 @@ class TestMaskTextMultipleAndCombined:
 
     def test_masks_email_phone_and_address_all_present(self) -> None:
         # Separated by prose so the three regexes do not overlap.
-        text = (
-            "Email: jane@example.com. "
-            "Phone: 555-123-4567. "
-            "Address: 742 Evergreen Terrace."
-        )
+        text = "Email: jane@example.com. Phone: 555-123-4567. Address: 742 Evergreen Terrace."
         out = pii.mask_text(text)
         assert "jane@example.com" not in out
         assert "555-123-4567" not in out

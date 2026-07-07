@@ -1,20 +1,25 @@
-"""LangGraph state machine — milestone 1: the analysis happy path.
+"""LangGraph state machine — the full agent graph (docs/architecture.md §3).
 
-Node names follow `docs/architecture.md` §3 exactly:
+Analysis branch:
 
     load_context → intent_router → trio_retrieval → sql_generation
-    → sql_guard (static guard + LIMIT + BigQuery dry-run)
-    → bigquery_execute → report_generation
+    → sql_guard (read-only guard + PII denylist + LIMIT + BigQuery dry-run)
+    → bigquery_execute → pii_mask → report_generation → save_report
 
 Dry-run failures, execution errors, and empty result sets route to
 ``sql_repair`` (re-prompt with the verbatim error), capped at
 ``MAX_HEAL_ATTEMPTS`` (2) via ``retry_count``; on exhaustion,
 ``graceful_failure`` summarises every attempt — never a stack trace.
-PII masking and the report-management branch land in later milestones.
+
+The other intents fan out from ``intent_router``: ``report_mgmt`` runs the
+interrupt-guarded delete branch (match_reports → confirm_delete →
+execute_delete / cancel_delete), ``meta`` persists a presentation preference
+(set_preference), and anything out of scope gets ``polite_refusal``.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from datetime import UTC, datetime
@@ -142,8 +147,8 @@ def polite_refusal(state: AgentState) -> AgentState:
         "I answer aggregate questions about sales, revenue, products, and "
         "customer trends, and I can manage your saved reports. I can't share "
         "personal customer data (emails, phone numbers, addresses) or raw table "
-        "dumps. Try asking, for example, \"Which product categories drove the "
-        "most revenue last quarter?\""
+        'dumps. Try asking, for example, "Which product categories drove the '
+        'most revenue last quarter?"'
     )
     return {"final_response": message}
 
@@ -176,8 +181,7 @@ def sql_generation(state: AgentState) -> AgentState:
 
     trios = state.get("retrieved_trios") or []
     trios_text = (
-        "\n\n".join(f"Q: {t['question']}\nSQL:\n{t['sql']}" for t in trios)
-        or "(none available)"
+        "\n\n".join(f"Q: {t['question']}\nSQL:\n{t['sql']}" for t in trios) or "(none available)"
     )
     template = _read_text(PROMPTS_DIR / "sql_generation.md")
     prompt = (
@@ -310,13 +314,47 @@ def _format_bullets(rows: list[dict[str, object]]) -> str:
     return "\n".join(lines)
 
 
-def report_generation(state: AgentState) -> AgentState:
-    """Format the (already-masked) result set into the executive report.
+def _narrative_summary(state: AgentState, rows: list[dict[str, object]]) -> str | None:
+    """LLM executive summary over the already-masked rows, in the persona's tone.
 
-    Honours the caller's stored presentation preference (§5.4): ``table`` (the
-    default pandas grid) or ``bullets`` (one line per row). Refuses to run on
-    unmasked data, and runs a final deterministic PII sweep over its own prose —
-    masking is applied after generation, never trusted to it.
+    The hot-loaded ``persona.md`` is the system prompt (§5.8 — editing the file
+    changes the very next report's tone), and retrieved-trio style notes are the
+    exemplars (§5.1). Degrades, never blocks: any LLM failure or a missing
+    template returns ``None`` and the report falls back to data-only output.
+    """
+    persona = state.get("persona") or ""
+    question = _last_user_question(state)
+    if not (persona and question and rows):
+        return None
+    template = _read_text(PROMPTS_DIR / "report_generation.md")
+    if not template:
+        return None
+    trios = state.get("retrieved_trios") or []
+    style_notes = "\n".join(f"- {t['report']}" for t in trios if t.get("report")) or "(none)"
+    rows_json = json.dumps(rows[:MAX_REPORT_ROWS], ensure_ascii=False, default=str)
+    prompt = (
+        template.replace("{question}", question)
+        .replace("{rows}", rows_json)
+        .replace("{style_notes}", style_notes)
+    )
+    try:
+        summary = generate(persona, prompt).strip()
+    except LLMError as exc:
+        logger.warning("report narrative degraded to data-only output: %s", exc)
+        return None
+    return summary or None
+
+
+def report_generation(state: AgentState) -> AgentState:
+    """Compose the executive report: persona-toned narrative + masked data.
+
+    The narrative headline comes from the LLM (persona as system prompt, trio
+    style notes as exemplars) and degrades to a plain data answer if the LLM is
+    unavailable. The data body honours the caller's stored presentation
+    preference (§5.4): ``table`` (the default pandas grid) or ``bullets`` (one
+    line per row). Refuses to run on unmasked data, and runs a final
+    deterministic PII sweep over the whole response — masking is applied after
+    generation, never trusted to it.
     """
     if not state.get("masked"):
         logger.error("report_generation reached with masked=False — refusing")
@@ -324,7 +362,9 @@ def report_generation(state: AgentState) -> AgentState:
     rows = state.get("result_rows") or []
     fmt = (state.get("preferences") or {}).get("format", DEFAULT_FORMAT)
     body = _format_bullets(rows) if fmt == "bullets" else _format_table(rows)
-    lines = [f"Here is what I found ({len(rows)} row{'s' if len(rows) != 1 else ''}):", "", body]
+    summary = _narrative_summary(state, rows)
+    header = summary or f"Here is what I found ({len(rows)} row{'s' if len(rows) != 1 else ''}):"
+    lines = [header, "", body]
     if len(rows) > MAX_REPORT_ROWS:
         lines.append(f"... ({len(rows) - MAX_REPORT_ROWS} more rows not shown)")
     return {"final_response": pii.mask_text("\n".join(lines))}
@@ -359,9 +399,7 @@ def sql_repair(state: AgentState) -> AgentState:
     failed_sql = state.get("sql") or "(no SQL was produced)"
     error = state.get("sql_error") or "unknown error"
     attempt = state.get("retry_count", 0) + 1
-    logger.warning(
-        "sql_repair: heal attempt %d/%d — error: %s", attempt, MAX_HEAL_ATTEMPTS, error
-    )
+    logger.warning("sql_repair: heal attempt %d/%d — error: %s", attempt, MAX_HEAL_ATTEMPTS, error)
     template = _read_text(PROMPTS_DIR / "sql_repair.md")
     prompt = (
         template.replace("{schema}", _read_text(SCHEMA_DOC))
@@ -432,7 +470,7 @@ def set_preference(state: AgentState) -> AgentState:
         return {
             "final_response": (
                 "I can remember how you like results presented — just say "
-                "\"remember I prefer tables\" or \"remember I prefer bullets\"."
+                '"remember I prefer tables" or "remember I prefer bullets".'
             )
         }
     try:

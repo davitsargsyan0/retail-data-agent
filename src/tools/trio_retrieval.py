@@ -89,9 +89,7 @@ class TrioRetriever:
             return None
         if meta.get("corpus_hash") != corpus_hash:
             return None
-        matrix: npt.NDArray[np.float64] = np.asarray(
-            np.load(self._cache_path), dtype=np.float64
-        )
+        matrix: npt.NDArray[np.float64] = np.asarray(np.load(self._cache_path), dtype=np.float64)
         if matrix.shape[0] != count:
             return None
         logger.info("trio embeddings loaded from cache (%d trios)", count)
