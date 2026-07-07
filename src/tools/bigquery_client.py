@@ -139,6 +139,18 @@ class BigQueryClient:
         )
         self._client: bigquery.Client | None = None
 
+    @staticmethod
+    def _clean_error(exc: gcloud_exceptions.GoogleAPICallError) -> str:
+        """Prefer BigQuery's structured error message (e.g. 'Unrecognized name:
+        foo at [3:16]') over the raw HTTP text with URL and job-ID noise —
+        cleaner for both the self-heal prompt and the user."""
+        for error in exc.errors or []:
+            if isinstance(error, dict):
+                message = error.get("message")
+                if isinstance(message, str) and message:
+                    return message
+        return exc.message or str(exc)
+
     @property
     def client(self) -> bigquery.Client:
         """Lazily created underlying client (avoids auth at import time)."""
@@ -166,7 +178,7 @@ class BigQueryClient:
         try:
             job = self.client.query(sql, job_config=job_config)
         except gcloud_exceptions.GoogleAPICallError as exc:
-            raise BigQueryExecutionError(exc.message or str(exc)) from exc
+            raise BigQueryExecutionError(self._clean_error(exc)) from exc
         bytes_processed = int(job.total_bytes_processed or 0)
         logger.info("dry_run ok: %d bytes would be processed", bytes_processed)
         return bytes_processed
@@ -185,6 +197,6 @@ class BigQueryClient:
             job = self.client.query(bounded_sql, job_config=job_config)
             rows = [dict(row.items()) for row in job.result()]
         except gcloud_exceptions.GoogleAPICallError as exc:
-            raise BigQueryExecutionError(exc.message or str(exc)) from exc
+            raise BigQueryExecutionError(self._clean_error(exc)) from exc
         logger.info("execute ok: %d rows, %s bytes processed", len(rows), job.total_bytes_processed)
         return pd.DataFrame(rows)

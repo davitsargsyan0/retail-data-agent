@@ -31,6 +31,14 @@ class ReportRef(TypedDict):
     created_at: str
 
 
+class HealAttempt(TypedDict):
+    """One failed SQL attempt — feeds ``sql_repair`` and the graceful-failure
+    "here's what I tried" message."""
+
+    sql: str
+    error: str
+
+
 class AgentState(TypedDict, total=False):
     """Single graph state, checkpointed after every node.
 
@@ -46,6 +54,7 @@ class AgentState(TypedDict, total=False):
     sql: str | None
     sql_error: str | None
     retry_count: int
+    heal_attempts: list[HealAttempt]
     result_rows: list[dict[str, object]] | None
     masked: bool
     matched_reports: list[ReportRef]

@@ -30,6 +30,7 @@ _PROGRESS: dict[str, str] = {
     "sql_generation": "writing SQL",
     "sql_guard": "validating SQL (dry run)",
     "bigquery_execute": "querying BigQuery",
+    "sql_repair": "self-healing SQL",
     "report_generation": "writing report",
     "graceful_failure": "recovering",
 }
@@ -38,6 +39,8 @@ _PROGRESS: dict[str, str] = {
 def _print_node_update(node: str, update: dict[str, object]) -> None:
     """Render one streamed node update as CLI progress."""
     label = _PROGRESS.get(node, node)
+    if node == "sql_repair":
+        label += f" (attempt {update.get('retry_count', '?')})"
     print(f"  · {node} — {label}")
     if node == "trio_retrieval":
         trios = update.get("retrieved_trios")

@@ -6,16 +6,17 @@ Node names follow `docs/architecture.md` §3 exactly:
     → sql_guard (static guard + LIMIT + BigQuery dry-run)
     → bigquery_execute → report_generation
 
-Guard/execution failures route to ``graceful_failure`` so the CLI never sees a
-stack trace. The self-heal loop (``sql_repair``), PII masking, and the
-report-management branch land in later milestones.
+Dry-run failures, execution errors, and empty result sets route to
+``sql_repair`` (re-prompt with the verbatim error), capped at
+``MAX_HEAL_ATTEMPTS`` (2) via ``retry_count``; on exhaustion,
+``graceful_failure`` summarises every attempt — never a stack trace.
+PII masking and the report-management branch land in later milestones.
 """
 
 from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Callable
 from pathlib import Path
 
 import pandas as pd
@@ -23,7 +24,7 @@ from langchain_core.messages import HumanMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
-from agent.state import AgentState
+from agent.state import AgentState, HealAttempt
 from tools.bigquery_client import BigQueryClient, BigQueryClientError
 from tools.llm import LLMError, generate
 from tools.trio_retrieval import TrioRetriever
@@ -35,6 +36,7 @@ PROMPTS_DIR = REPO_ROOT / "prompts"
 SCHEMA_DOC = REPO_ROOT / "docs" / "schema.md"
 
 MAX_REPORT_ROWS = 20
+MAX_HEAL_ATTEMPTS = 2  # hard self-heal budget (architecture §5.5)
 
 _bq = BigQueryClient()
 _retriever = TrioRetriever()
@@ -81,7 +83,7 @@ def _last_user_question(state: AgentState) -> str:
 def load_context(state: AgentState) -> AgentState:
     """Hot-load the persona from ``prompts/persona.md`` on every request."""
     persona = _read_text(PROMPTS_DIR / "persona.md", "You are a concise retail data analyst.")
-    return {"persona": persona, "retry_count": 0, "sql_error": None}
+    return {"persona": persona, "retry_count": 0, "sql_error": None, "heal_attempts": []}
 
 
 def intent_router(state: AgentState) -> AgentState:
@@ -137,15 +139,23 @@ def sql_generation(state: AgentState) -> AgentState:
     return {"sql": sql, "sql_error": None}
 
 
+def _record_attempt(state: AgentState, sql: str, error: str) -> list[HealAttempt]:
+    """Append a failed attempt to the heal history (state lists are replaced,
+    not merged, so we return the full list)."""
+    return [*state.get("heal_attempts", []), HealAttempt(sql=sql, error=error)]
+
+
 def sql_guard(state: AgentState) -> AgentState:
     """Static read-only guard + LIMIT injection + zero-cost BigQuery dry-run."""
     sql = state.get("sql")
     if not sql:
-        return {"sql_error": state.get("sql_error") or "No SQL was generated."}
+        error = state.get("sql_error") or "No SQL was generated."
+        return {"sql_error": error, "heal_attempts": _record_attempt(state, "(none)", error)}
     try:
         bytes_estimate = _bq.dry_run(sql)
     except BigQueryClientError as exc:
-        return {"sql_error": str(exc)}
+        logger.warning("sql_guard: dry-run failed — %s", exc)
+        return {"sql_error": str(exc), "heal_attempts": _record_attempt(state, sql, str(exc))}
     logger.info("sql_guard: dry-run OK, ~%.2f MB would be scanned", bytes_estimate / 1e6)
     return {"sql_error": None}
 
@@ -158,10 +168,21 @@ def bigquery_execute(state: AgentState) -> AgentState:
     try:
         df = _bq.execute(sql)
     except BigQueryClientError as exc:
-        return {"sql_error": str(exc), "result_rows": None}
+        logger.warning("bigquery_execute: failed — %s", exc)
+        return {
+            "sql_error": str(exc),
+            "result_rows": None,
+            "heal_attempts": _record_attempt(state, sql, str(exc)),
+        }
     rows: list[dict[str, object]] = df.to_dict(orient="records")
     if not rows:
-        return {"sql_error": "Query returned zero rows.", "result_rows": []}
+        error = "Query returned zero rows."
+        logger.warning("bigquery_execute: %s", error)
+        return {
+            "sql_error": error,
+            "result_rows": [],
+            "heal_attempts": _record_attempt(state, sql, error),
+        }
     return {"result_rows": rows, "sql_error": None}
 
 
@@ -178,26 +199,70 @@ def report_generation(state: AgentState) -> AgentState:
     return {"final_response": "\n".join(lines)}
 
 
+def sql_repair(state: AgentState) -> AgentState:
+    """Self-heal: regenerate the SQL from the question, the failed SQL, and
+    the verbatim error. Increments ``retry_count`` (hard cap enforced by the
+    routers, architecture §5.5)."""
+    question = _last_user_question(state)
+    failed_sql = state.get("sql") or "(no SQL was produced)"
+    error = state.get("sql_error") or "unknown error"
+    attempt = state.get("retry_count", 0) + 1
+    logger.warning(
+        "sql_repair: heal attempt %d/%d — error: %s", attempt, MAX_HEAL_ATTEMPTS, error
+    )
+    template = _read_text(PROMPTS_DIR / "sql_repair.md")
+    prompt = (
+        template.replace("{schema}", _read_text(SCHEMA_DOC))
+        .replace("{question}", question)
+        .replace("{failed_sql}", failed_sql)
+        .replace("{error}", error)
+    )
+    try:
+        raw = generate("You fix broken BigQuery SELECT statements.", prompt)
+    except LLMError as exc:
+        return {"sql_error": f"LLM unavailable during repair: {exc}", "retry_count": attempt}
+    sql = normalize_table_references(_CODE_FENCE.sub("", raw).strip())
+    return {"sql": sql, "sql_error": None, "retry_count": attempt}
+
+
 def graceful_failure(state: AgentState) -> AgentState:
-    """Apologise in plain language — never a stack trace."""
-    reason = state.get("sql_error") or "an unexpected problem"
-    return {
-        "final_response": (
-            "I couldn't get a reliable answer to that just now "
-            f"(reason: {reason}).\n"
-            "Please try rephrasing the question — for example, name the exact "
-            "metric and the time range you care about."
-        )
-    }
+    """Apologise in plain language, listing what was tried — never a stack
+    trace."""
+    attempts = state.get("heal_attempts") or []
+    lines = ["I couldn't complete that analysis reliably, even after retrying."]
+    if attempts:
+        lines.append("Here's what I tried:")
+        for number, attempt in enumerate(attempts, start=1):
+            sql_first_line = attempt["sql"].strip().splitlines()[0][:80]
+            lines.append(f"  {number}. `{sql_first_line} ...` → {attempt['error']}")
+    else:
+        lines.append(f"Reason: {state.get('sql_error') or 'an unexpected problem'}.")
+    lines.append(
+        "Please try rephrasing the question — for example, name the exact "
+        "metric and the time range you care about."
+    )
+    return {"final_response": "\n".join(lines)}
 
 
-def _route_on_error(ok_node: str) -> Callable[[AgentState], str]:
-    """Build a conditional-edge router: on ``sql_error`` → graceful_failure."""
+def _heal_or_fail(state: AgentState) -> str:
+    """Shared retry decision: heal while budget remains, else fail gracefully."""
+    if state.get("retry_count", 0) < MAX_HEAL_ATTEMPTS:
+        return "sql_repair"
+    return "graceful_failure"
 
-    def route(state: AgentState) -> str:
-        return "graceful_failure" if state.get("sql_error") else ok_node
 
-    return route
+def _route_after_guard(state: AgentState) -> str:
+    return _heal_or_fail(state) if state.get("sql_error") else "bigquery_execute"
+
+
+def _route_after_execute(state: AgentState) -> str:
+    return _heal_or_fail(state) if state.get("sql_error") else "report_generation"
+
+
+def _route_after_repair(state: AgentState) -> str:
+    """Repaired SQL goes back through the guard; a repair-time LLM failure
+    exits gracefully instead of burning the remaining budget."""
+    return "graceful_failure" if state.get("sql_error") else "sql_guard"
 
 
 def build_graph() -> CompiledStateGraph[AgentState, None, AgentState, AgentState]:
@@ -209,6 +274,7 @@ def build_graph() -> CompiledStateGraph[AgentState, None, AgentState, AgentState
     builder.add_node("sql_generation", sql_generation)
     builder.add_node("sql_guard", sql_guard)
     builder.add_node("bigquery_execute", bigquery_execute)
+    builder.add_node("sql_repair", sql_repair)
     builder.add_node("report_generation", report_generation)
     builder.add_node("graceful_failure", graceful_failure)
 
@@ -219,13 +285,18 @@ def build_graph() -> CompiledStateGraph[AgentState, None, AgentState, AgentState
     builder.add_edge("sql_generation", "sql_guard")
     builder.add_conditional_edges(
         "sql_guard",
-        _route_on_error("bigquery_execute"),
-        ["bigquery_execute", "graceful_failure"],
+        _route_after_guard,
+        ["bigquery_execute", "sql_repair", "graceful_failure"],
     )
     builder.add_conditional_edges(
         "bigquery_execute",
-        _route_on_error("report_generation"),
-        ["report_generation", "graceful_failure"],
+        _route_after_execute,
+        ["report_generation", "sql_repair", "graceful_failure"],
+    )
+    builder.add_conditional_edges(
+        "sql_repair",
+        _route_after_repair,
+        ["sql_guard", "graceful_failure"],
     )
     builder.add_edge("report_generation", END)
     builder.add_edge("graceful_failure", END)
