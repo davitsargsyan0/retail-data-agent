@@ -39,6 +39,25 @@ _bq = BigQueryClient()
 
 _CODE_FENCE = re.compile(r"^```[a-zA-Z]*\n|\n?```$", re.MULTILINE)
 
+# A fully-qualified thelook table reference NOT already wrapped in backticks,
+# e.g. "FROM bigquery-public-data.thelook_ecommerce.order_items" — BigQuery
+# rejects the unquoted form with "Unrecognized name: bigquery".
+_UNQUOTED_TABLE_REF = re.compile(
+    r"(?<!`)\b(bigquery-public-data\.thelook_ecommerce\.[A-Za-z_][A-Za-z0-9_]*)\b"
+)
+
+
+def normalize_table_references(sql: str) -> str:
+    """Backtick-wrap bare ``bigquery-public-data.thelook_ecommerce.<table>`` refs.
+
+    Deterministic safety net behind the prompt rules: the model is instructed
+    to quote and alias every table, but if it still emits a bare dotted path
+    (``FROM bigquery-public-data.thelook_ecommerce.order_items``, or a dotted
+    column path like ``...order_items.created_at``), the table part is wrapped
+    in backticks so the query parses. Already-quoted references are untouched.
+    """
+    return _UNQUOTED_TABLE_REF.sub(r"`\1`", sql)
+
 
 def _read_text(path: Path, fallback: str = "") -> str:
     """Read a text file, returning ``fallback`` if it does not exist."""
@@ -98,7 +117,7 @@ def sql_generation(state: AgentState) -> AgentState:
         )
     except LLMError as exc:
         return {"sql": None, "sql_error": f"LLM unavailable: {exc}"}
-    sql = _CODE_FENCE.sub("", raw).strip()
+    sql = normalize_table_references(_CODE_FENCE.sub("", raw).strip())
     return {"sql": sql, "sql_error": None}
 
 
@@ -150,8 +169,8 @@ def graceful_failure(state: AgentState) -> AgentState:
         "final_response": (
             "I couldn't get a reliable answer to that just now "
             f"(reason: {reason}).\n"
-            "Could you try rephrasing the question — for example, naming the "
-            "metric and time range you care about?"
+            "Please try rephrasing the question — for example, name the exact "
+            "metric and the time range you care about."
         )
     }
 
