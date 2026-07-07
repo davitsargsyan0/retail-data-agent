@@ -22,6 +22,7 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
 
 from agent.graph import build_graph
+from agent.observability import set_debug
 from agent.state import AgentState
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -30,6 +31,7 @@ _PROGRESS: dict[str, str] = {
     "load_context": "loading persona",
     "intent_router": "routing intent",
     "polite_refusal": "declining (out of scope)",
+    "set_preference": "saving your preference",
     "trio_retrieval": "searching golden bucket",
     "sql_generation": "writing SQL",
     "sql_guard": "validating SQL (dry run)",
@@ -131,9 +133,13 @@ def run_turn(
 
 def main() -> int:
     load_dotenv(REPO_ROOT / ".env")
+    debug = "--debug" in sys.argv[1:]
+    set_debug(debug)
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
 
     print("retail-data-agent — ask a question about sales, products, or customers.")
+    if debug:
+        print("[debug] per-node traces will stream to stderr (also logs/agent.jsonl).")
     print("Type 'exit' to quit.\n")
     graph = build_graph()
 

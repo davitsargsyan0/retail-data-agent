@@ -27,11 +27,13 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import interrupt
 
+from agent.observability import NodeFn, instrument
 from agent.state import AgentState, HealAttempt, ReportRef
 from reports_store.store import ReportStore, parse_delete_request
 from safety import intent_gate, pii
 from tools.bigquery_client import BigQueryClient, BigQueryClientError
 from tools.llm import LLMError, generate
+from tools.prefs_store import DEFAULT_FORMAT, PrefsStore, parse_format
 from tools.trio_retrieval import TrioRetriever
 
 logger = logging.getLogger(__name__)
@@ -47,11 +49,13 @@ MAX_HEAL_ATTEMPTS = 2  # hard self-heal budget (architecture §5.5)
 _bq = BigQueryClient()
 _retriever = TrioRetriever()
 _store = ReportStore(DATA_DIR)
+_prefs = PrefsStore(DATA_DIR)
 
-# Maps the intent-gate's three categories onto the state's routing literal.
+# Maps the intent-gate's categories onto the state's routing literal.
 _INTENT_MAP: dict[str, str] = {
     "analysis": "analysis",
     "report_management": "report_mgmt",
+    "meta": "meta",
     "out_of_scope": "refuse",
 }
 
@@ -95,9 +99,23 @@ def _last_user_question(state: AgentState) -> str:
 
 
 def load_context(state: AgentState) -> AgentState:
-    """Hot-load the persona from ``prompts/persona.md`` on every request."""
+    """Hot-load the persona and the caller's presentation preference each request.
+
+    ``persona.md`` is re-read from disk on every turn (no cache), so an edit to
+    the file changes the very next answer's tone — the agility requirement (§5.8).
+    The user's stored ``format`` preference (§5.4) is loaded into ``preferences``
+    here so ``report_generation`` can honour it without re-reading the store.
+    """
     persona = _read_text(PROMPTS_DIR / "persona.md", "You are a concise retail data analyst.")
-    return {"persona": persona, "retry_count": 0, "sql_error": None, "heal_attempts": []}
+    user = state.get("user_id") or "cli-user"
+    fmt = _prefs.get_format(user)
+    return {
+        "persona": persona,
+        "preferences": {"format": fmt},
+        "retry_count": 0,
+        "sql_error": None,
+        "heal_attempts": [],
+    }
 
 
 def intent_router(state: AgentState) -> AgentState:
@@ -264,21 +282,49 @@ def pii_mask(state: AgentState) -> AgentState:
     return {"result_rows": result.rows, "masked": True}
 
 
+def _format_value(value: object) -> str:
+    """Human-format a single cell for the bullet layout (floats → 2dp, commas)."""
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, float):
+        return f"{value:,.2f}"
+    if isinstance(value, int):
+        return f"{value:,}"
+    return str(value)
+
+
+def _format_table(rows: list[dict[str, object]]) -> str:
+    """Manager-A layout: the current pandas ``to_string`` grid."""
+    df = pd.DataFrame(rows)
+    return str(
+        df.head(MAX_REPORT_ROWS).to_string(index=False, float_format=lambda value: f"{value:,.2f}")
+    )
+
+
+def _format_bullets(rows: list[dict[str, object]]) -> str:
+    """Manager-B layout: one bullet line per row, ``key: value`` pairs."""
+    lines: list[str] = []
+    for row in rows[:MAX_REPORT_ROWS]:
+        pairs = ", ".join(f"{key}: {_format_value(value)}" for key, value in row.items())
+        lines.append(f"- {pairs}")
+    return "\n".join(lines)
+
+
 def report_generation(state: AgentState) -> AgentState:
     """Format the (already-masked) result set into the executive report.
 
-    Refuses to run on unmasked data, and runs a final deterministic PII sweep
-    over its own prose — masking is applied after the LLM, never trusted to it.
+    Honours the caller's stored presentation preference (§5.4): ``table`` (the
+    default pandas grid) or ``bullets`` (one line per row). Refuses to run on
+    unmasked data, and runs a final deterministic PII sweep over its own prose —
+    masking is applied after generation, never trusted to it.
     """
     if not state.get("masked"):
         logger.error("report_generation reached with masked=False — refusing")
         return {"final_response": "I couldn't prepare a safe answer for that request."}
     rows = state.get("result_rows") or []
-    df = pd.DataFrame(rows)
-    table = df.head(MAX_REPORT_ROWS).to_string(
-        index=False, float_format=lambda value: f"{value:,.2f}"
-    )
-    lines = [f"Here is what I found ({len(rows)} row{'s' if len(rows) != 1 else ''}):", "", table]
+    fmt = (state.get("preferences") or {}).get("format", DEFAULT_FORMAT)
+    body = _format_bullets(rows) if fmt == "bullets" else _format_table(rows)
+    lines = [f"Here is what I found ({len(rows)} row{'s' if len(rows) != 1 else ''}):", "", body]
     if len(rows) > MAX_REPORT_ROWS:
         lines.append(f"... ({len(rows) - MAX_REPORT_ROWS} more rows not shown)")
     return {"final_response": pii.mask_text("\n".join(lines))}
@@ -371,11 +417,42 @@ def _route_after_repair(state: AgentState) -> str:
     return "graceful_failure" if state.get("sql_error") else "sql_guard"
 
 
+def set_preference(state: AgentState) -> AgentState:
+    """Persist the caller's presentation preference and confirm (§5.4, meta intent).
+
+    Deterministic: the format is parsed from the user's words, written to the
+    prefs store keyed by ``user_id``, and echoed back into ``preferences`` so the
+    change is visible in this turn's state too. A persistence failure degrades to
+    a plain acknowledgement rather than crashing the turn.
+    """
+    question = _last_user_question(state)
+    user = state.get("user_id") or "cli-user"
+    fmt = parse_format(question)
+    if fmt is None:
+        return {
+            "final_response": (
+                "I can remember how you like results presented — just say "
+                "\"remember I prefer tables\" or \"remember I prefer bullets\"."
+            )
+        }
+    try:
+        _prefs.set_format(user, fmt)
+    except OSError as exc:  # persistence is best-effort, never fatal
+        logger.warning("set_preference: could not persist preference: %s", exc)
+    label = "bullets" if fmt == "bullets" else "tables"
+    logger.info("set_preference: %s now prefers %s", user, fmt)
+    return {
+        "preferences": {"format": fmt},
+        "final_response": f"Got it — I'll use {label} from now on.",
+    }
+
+
 def _route_intent(state: AgentState) -> str:
-    """Fan out from the intent router to the three top-level branches."""
+    """Fan out from the intent router to the top-level branches."""
     return {
         "analysis": "trio_retrieval",
         "report_mgmt": "match_reports",
+        "meta": "set_preference",
         "refuse": "polite_refusal",
     }.get(state.get("intent", "refuse"), "polite_refusal")
 
@@ -513,29 +590,37 @@ def build_graph() -> CompiledStateGraph[AgentState, None, AgentState, AgentState
     ``interrupt()`` to persist state across the pause/resume boundary (ADR-004).
     """
     builder = StateGraph(AgentState)
-    builder.add_node("load_context", load_context)
-    builder.add_node("intent_router", intent_router)
-    builder.add_node("polite_refusal", polite_refusal)
-    builder.add_node("trio_retrieval", trio_retrieval)
-    builder.add_node("sql_generation", sql_generation)
-    builder.add_node("sql_guard", sql_guard)
-    builder.add_node("bigquery_execute", bigquery_execute)
-    builder.add_node("sql_repair", sql_repair)
-    builder.add_node("pii_mask", pii_mask)
-    builder.add_node("report_generation", report_generation)
-    builder.add_node("save_report", save_report)
-    builder.add_node("graceful_failure", graceful_failure)
-    builder.add_node("match_reports", match_reports)
-    builder.add_node("confirm_delete", confirm_delete)
-    builder.add_node("execute_delete", execute_delete)
-    builder.add_node("cancel_delete", cancel_delete)
+
+    # Register every node through the observability wrapper so each execution
+    # emits one structured trace line (architecture §5.7) — instrumentation is
+    # applied uniformly here, never hand-edited into the node bodies.
+    def _add(name: str, fn: NodeFn) -> None:
+        builder.add_node(name, instrument(name, fn))
+
+    _add("load_context", load_context)
+    _add("intent_router", intent_router)
+    _add("polite_refusal", polite_refusal)
+    _add("set_preference", set_preference)
+    _add("trio_retrieval", trio_retrieval)
+    _add("sql_generation", sql_generation)
+    _add("sql_guard", sql_guard)
+    _add("bigquery_execute", bigquery_execute)
+    _add("sql_repair", sql_repair)
+    _add("pii_mask", pii_mask)
+    _add("report_generation", report_generation)
+    _add("save_report", save_report)
+    _add("graceful_failure", graceful_failure)
+    _add("match_reports", match_reports)
+    _add("confirm_delete", confirm_delete)
+    _add("execute_delete", execute_delete)
+    _add("cancel_delete", cancel_delete)
 
     builder.add_edge(START, "load_context")
     builder.add_edge("load_context", "intent_router")
     builder.add_conditional_edges(
         "intent_router",
         _route_intent,
-        ["trio_retrieval", "match_reports", "polite_refusal"],
+        ["trio_retrieval", "match_reports", "set_preference", "polite_refusal"],
     )
 
     # Analysis branch
@@ -572,4 +657,5 @@ def build_graph() -> CompiledStateGraph[AgentState, None, AgentState, AgentState
     builder.add_edge("cancel_delete", END)
 
     builder.add_edge("polite_refusal", END)
+    builder.add_edge("set_preference", END)
     return builder.compile(checkpointer=MemorySaver())

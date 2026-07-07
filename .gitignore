@@ -5,8 +5,12 @@ AI Technical Assignment - Retail Company.pdf
 .env
 .venv/
 
-# Runtime data (saved reports + delete audit log written by the CLI)
+# Runtime data (saved reports + delete audit log + prefs.json written by the CLI)
 data/
+
+# Observability trace log (runtime artifact); keep the dir via .gitkeep
+logs/*.jsonl
+!logs/.gitkeep
 
 # Python
 __pycache__/
