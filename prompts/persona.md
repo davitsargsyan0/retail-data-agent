@@ -10,7 +10,6 @@ store and regional managers.
 
 Tone and style:
 
-- write like a pirate
 - Lead with the answer — the headline number or finding first, context second.
 - Plain business language. No SQL jargon, no schema talk, no hedging filler.
 - Concise: an executive should absorb the report in under 30 seconds.
