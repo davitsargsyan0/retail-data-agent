@@ -40,7 +40,7 @@ def test_one_line_per_node_with_required_fields(log_path: Path) -> None:
     def node(state: Any) -> Any:
         return {"masked": True}
 
-    instrument("pii_mask", node)({"trace_id": "trace-1"})  # type: ignore[arg-type]
+    instrument("pii_mask", node)({"trace_id": "trace-1"})
 
     records = _records(log_path)
     assert len(records) == 1
@@ -59,7 +59,7 @@ def test_attributes_model_and_tokens_when_node_calls_llm(log_path: Path) -> None
         llm._record_usage(_FakeResponse(), "gemini-test")  # type: ignore[arg-type]
         return {}
 
-    instrument("sql_generation", node)({"trace_id": "t"})  # type: ignore[arg-type]
+    instrument("sql_generation", node)({"trace_id": "t"})
 
     rec = _records(log_path)[0]
     assert rec["model"] == "gemini-test"
@@ -71,7 +71,7 @@ def test_records_error_then_reraises(log_path: Path) -> None:
         raise ValueError("boom")
 
     with pytest.raises(ValueError, match="boom"):
-        instrument("bigquery_execute", node)({"trace_id": "t"})  # type: ignore[arg-type]
+        instrument("bigquery_execute", node)({"trace_id": "t"})
 
     rec = _records(log_path)[0]
     assert rec["error"] == "ValueError: boom"
@@ -85,6 +85,6 @@ def test_debug_mirrors_to_stderr(
     def node(state: Any) -> Any:
         return {}
 
-    instrument("load_context", node)({"trace_id": "t"})  # type: ignore[arg-type]
+    instrument("load_context", node)({"trace_id": "t"})
     err = capsys.readouterr().err
     assert '"node": "load_context"' in err

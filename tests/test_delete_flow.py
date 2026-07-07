@@ -39,11 +39,14 @@ def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ReportStore:
     return store
 
 
-def _start(question: str) -> tuple[Any, dict[str, Any]]:
+def _start(question: str) -> tuple[Any, dict[str, Any], dict[str, Any]]:
     graph = graph_module.build_graph()
-    config = {"configurable": {"thread_id": uuid.uuid4().hex}}
-    state = {"messages": [HumanMessage(content=question)], "user_id": "cli-user"}
-    return graph, config, state  # type: ignore[return-value]
+    config: dict[str, Any] = {"configurable": {"thread_id": uuid.uuid4().hex}}
+    state: dict[str, Any] = {
+        "messages": [HumanMessage(content=question)],
+        "user_id": "cli-user",
+    }
+    return graph, config, state
 
 
 class TestDeleteFlow:
