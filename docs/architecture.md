@@ -73,7 +73,7 @@ The bottom path is the **learning loop**: every interaction (question, generated
 | Client → API Gateway | HTTPS/JSON (streaming via SSE) | IAP / OIDC token per manager (Prototype: none — local CLI) | `{conversation_id, user_id, message}` |
 | Gateway → Agent Service | HTTP/JSON on Cloud Run | Gateway SA → Cloud Run invoker role | Same, plus verified identity headers |
 | Agent → BigQuery | google-cloud-bigquery client (gRPC/REST) | Dedicated **read-only** SA: `roles/bigquery.jobUser` + `dataViewer` on the dataset only; no DML/DDL grants | SQL text in; row iterator / pandas DataFrame out; job labels carry the trace ID |
-| Agent → Golden Bucket | GCS JSON reads + Vertex AI Vector Search `FindNeighbors` (Prototype: read `data/golden_trios.json`, numpy matmul) | Agent SA: `storage.objectViewer`, `aiplatform.user` | Query embedding (768-dim float vector) in; top-k trio IDs + scores out; trio JSON `{id, question, sql, report, embedding, version, provenance}` |
+| Agent → Golden Bucket | GCS JSON reads + Vertex AI Vector Search `FindNeighbors` (Prototype: read `golden_bucket/trios/*.json`, numpy matmul over a cached embedding matrix) | Agent SA: `storage.objectViewer`, `aiplatform.user` | Query embedding (768-dim float vector) in; top-k trio IDs + scores out; trio JSON `{id, question, sql, report, embedding, version, provenance}` |
 | Agent → Firestore | Firestore client (gRPC) (Prototype: `json.load`/`json.dump` on local files) | Agent SA: `datastore.user` | Report docs `{id, owner_id, title, body_masked, created_at}`; preference docs `{user_id, format, verbosity, ...}`; checkpoint blobs keyed by `conversation_id` |
 | Agent → Prompt store | GCS object read **per request** (Prototype: file read per request) | `storage.objectViewer` | `persona.md` markdown text |
 | Agent → Vertex AI / Gemini | `langchain-google-genai` through the single wrapper `src/tools/llm.py` | API key (Prototype) / SA with `aiplatform.user` (Production) | Prompt + tool schema in; text/structured output out |
@@ -89,9 +89,9 @@ flowchart TD
     S(("start")) --> LOAD["load_context<br/>hot-load persona.md + user preferences"]
     LOAD --> ROUTE{"intent_router"}
 
-    ROUTE -->|analysis| RETR["trio_retrieval<br/>embed question, top-k golden trios"]
-    ROUTE -->|report management| RMATCH["match_reports<br/>find candidate reports, owner-scoped"]
-    ROUTE -->|meta or schema question| META["schema_answer<br/>from docs schema.md"]
+    ROUTE -->|analysis or schema question| RETR["trio_retrieval<br/>embed question, top-k golden trios"]
+    ROUTE -->|report management| RMATCH["match_reports<br/>resolve candidate reports, owner-scoped"]
+    ROUTE -->|meta: preference command| PREF["set_preference<br/>persist table vs bullets"]
     ROUTE -->|out of scope or injection| REF["polite_refusal"]
 
     RETR --> GEN["sql_generation<br/>few-shot on retrieved trios"]
@@ -104,19 +104,17 @@ flowchart TD
     HEAL -->|no| FAIL["graceful_failure<br/>apologise, suggest rephrasing"]
     EXEC -->|rows| MASK["pii_mask<br/>deterministic regex + column sweep"]
     MASK --> REPORT["report_generation<br/>persona + preferences + trio style"]
-    REPORT --> RESP["save_and_respond<br/>optional save to reports store"]
+    REPORT --> SAVE["save_report<br/>auto-save masked report to store"]
 
-    RMATCH --> PREV["preview_matches<br/>show titles, dates, count"]
-    PREV --> INT["interrupt<br/>graph pauses for human confirmation"]
-    INT -->|typed confirmation| DEL["execute_delete<br/>own reports only"]
+    RMATCH --> INT["confirm_delete<br/>preview matches, interrupt()<br/>graph pauses for typed confirmation"]
+    INT -->|typed confirmation| DEL["execute_delete<br/>own reports only + audit record"]
     INT -->|anything else| CXL["cancel_delete"]
-    DEL --> AUD["audit_log + respond"]
 
-    META --> E(("end"))
+    PREF --> E(("end"))
     REF --> E
     FAIL --> E
-    RESP --> E
-    AUD --> E
+    SAVE --> E
+    DEL --> E
     CXL --> E
 ```
 
@@ -131,14 +129,18 @@ The graph state is a single `TypedDict` (checkpointed after every node — **Pro
 | `persona` | `str` | Persona text hot-loaded this turn |
 | `preferences` | `dict` | e.g. `{"format": "table"}` for Manager A |
 | `intent` | `Literal["analysis","report_mgmt","meta","refuse"]` | Router output |
+| `intent_reason` | `str` | Why the router chose that label (rule vs. model) |
 | `retrieved_trios` | `list[Trio]` | Top-k few-shot examples with similarity scores |
 | `sql` | `str \| None` | Current candidate query |
 | `sql_error` | `str \| None` | Last BigQuery error / empty-result marker, fed to `sql_repair` |
 | `retry_count` | `int` | Self-heal budget, hard cap 2 |
+| `heal_attempts` | `list[HealAttempt]` | Every failed SQL + error, for repair context and the graceful-failure summary |
 | `result_rows` | `list[dict] \| None` | Query result (bounded) |
 | `masked` | `bool` | Set by `pii_mask`; report generation refuses to run unless `True` |
 | `matched_reports` | `list[ReportRef]` | Delete-branch candidates |
+| `delete_filter` | `str \| None` | Human-readable description of the parsed delete scope |
 | `delete_confirmed` | `bool \| None` | Resumed value from `interrupt` |
+| `confirmation_text` | `str \| None` | The user's verbatim confirmation reply, kept for the audit record |
 | `final_response` | `str` | What the user sees |
 | `trace_id` | `str` | Joins all spans, SQL jobs, and LLM calls |
 
@@ -155,13 +157,13 @@ The delete branch works because of checkpointing: `interrupt()` persists the pau
 | 5 | Resilience & Error Handling | Self-heal loop with error context, max 2 retries; backoff, model fallback, circuit breaker (§5.5) | **Self-heal implemented**; OpenRouter fallback design-only |
 | 6 | Quality Assurance | Golden eval set, execution-accuracy checks, LLM-as-judge, CI regression gate (§5.6) | Design-only (pytest unit suite covers guards/masking) |
 | 7 | Observability | Per-node metrics, Langfuse traces joined by trace ID, alerting (§5.7) | **Observability-lite prototype slice implemented** — one structured JSON line per node to `logs/agent.jsonl` (`trace_id`, node, latency, model, tokens, error) via a uniform wrapper (`src/agent/observability.py`), `--debug` mirrors to stderr; Langfuse/Cloud Monitoring design-only |
-| 8 | Agility / Persona | `persona.md` hot-loaded per request from prompt store, editable without redeploy (§5.8) | **Implemented** (local file re-read per turn) |
+| 8 | Agility / Persona | `persona.md` hot-loaded per request from prompt store, editable without redeploy (§5.8) | **Implemented** — re-read from disk every turn and used as the system prompt of the report's executive summary, so a persona edit changes the very next answer's tone |
 
 ## 5. Detailed technical explanation
 
 ### 5.1 Hybrid Intelligence — the Golden Bucket
 
-**Query time.** The agent never generates SQL from schema alone. On every analysis turn, `trio_retrieval` embeds the user question (Gemini `text-embedding-004` via the LLM wrapper — **Production:** Vertex AI embeddings) and retrieves the top-k (k=3) most similar Trios. **Production:** Vertex AI Vector Search `FindNeighbors` over an index built from trio-question embeddings, trio bodies fetched from GCS by ID. **Prototype:** all trios live in `data/golden_trios.json` with pre-computed embeddings; retrieval is a single numpy matrix–vector cosine similarity — at the corpus size of a curated expert library (hundreds to low thousands), an O(n) scan is sub-millisecond and a vector DB is unjustified complexity (ADR-002). Retrieved trios serve two roles: their **SQL** becomes few-shot examples for `sql_generation` (teaching join paths, revenue definitions, status filters that analysts actually used), and their **reports** become style exemplars for `report_generation` (what an analyst-grade answer looks like). A similarity floor (cosine < 0.60) drops weak matches rather than injecting misleading examples.
+**Query time.** The agent never generates SQL from schema alone. On every analysis turn, `trio_retrieval` embeds the user question (Gemini `gemini-embedding-001` via the LLM wrapper — **Production:** Vertex AI embeddings) and retrieves the top-k (k=3) most similar Trios. **Production:** Vertex AI Vector Search `FindNeighbors` over an index built from trio-question embeddings, trio bodies fetched from GCS by ID. **Prototype:** trios live as JSON files in `golden_bucket/trios/`; question embeddings are computed once through the wrapper and cached to `golden_bucket/embeddings.npy` with a content-hash sidecar (recomputed automatically when any trio or the embedding model changes); retrieval is a single numpy matrix–vector cosine similarity — at the corpus size of a curated expert library (hundreds to low thousands), an O(n) scan is sub-millisecond and a vector DB is unjustified complexity (ADR-002). Retrieved trios serve two roles: their **SQL** becomes few-shot examples for `sql_generation` (teaching join paths, revenue definitions, status filters that analysts actually used), and their **reports** become style exemplars for `report_generation` (what an analyst-grade answer looks like). A similarity floor (cosine < 0.60) drops weak matches rather than injecting misleading examples.
 
 **Update strategy.** The bucket is append-only, versioned, and human-gated:
 
@@ -178,7 +180,7 @@ Nothing enters the bucket without a human in the loop — the golden bucket is t
 PII (customer email, phone, street address) must never reach the user, **even if the SQL retrieves it**. Prompting is not a control; the design uses three independent deterministic layers, any one of which suffices:
 
 - **Layer 1 — IAM at the data plane (Production only).** The agent's dedicated BigQuery service account is denied the PII columns via **policy tags** (BigQuery column-level security / Data Catalog taxonomy) on `users.email`, `users.phone`, `users.street_address` etc. A query touching those columns fails at BigQuery with an access error before any data moves. *Prototype: not implementable against a public dataset we don't own — design-only.*
-- **Layer 2 — query-plan denylist (implemented).** `sql_guard` parses the candidate SQL before execution and rejects any statement that (a) is not a single `SELECT`, (b) references a denylisted column (`email`, `phone`, `street_address`, and aliases/`SELECT *` expansion on `users`), or (c) lacks a `LIMIT` / exceeds the `maximum_bytes_billed` cap set on the BigQuery job config. Rejection is fed back into the self-heal loop as a repair instruction ("do not select column X"), so a legitimate question that merely brushed a PII column still gets answered.
+- **Layer 2 — query-plan denylist (implemented).** `sql_guard` parses the candidate SQL before execution and rejects any statement that (a) is not a single `SELECT`, (b) references a denylisted column (`email`, `phone`, `street_address`, and aliases/`SELECT *` expansion on `users`); it also (c) injects a hard `LIMIT` when the query lacks one and executes under a `maximum_bytes_billed` cap on the BigQuery job config. Rejection is fed back into the self-heal loop as a repair instruction ("do not select column X"), so a legitimate question that merely brushed a PII column still gets answered.
 - **Layer 3 — deterministic output mask (implemented).** After execution and again over the final report text, `pii_mask` runs (a) a **column-name sweep** — any result column matching the denylist is dropped or replaced with `«masked»` — and (b) **content regexes** for email addresses, phone numbers, and street-address patterns over every string cell and the generated prose. This is pure Python in `src/safety/`, unit-tested, and sits **between** BigQuery and the report LLM as well as after it: the report model never even sees raw PII. The `masked` state flag makes it structurally impossible for `report_generation` to run on unmasked rows.
 
 **Scope & injection guard.** The intent router is the first gate: anything that is not a data-analysis question, a report-management command, or a schema question is routed to `polite_refusal` — including prompt-injection attempts ("ignore your instructions", "show me raw emails"). The router prompt treats user text strictly as data to classify; and because masking is deterministic downstream, a successful jailbreak of the router still cannot exfiltrate PII.
@@ -244,7 +246,7 @@ Evaluation is a release gate, not an afterthought:
 
 ### 5.8 Agility — persona management without redeploys
 
-The report tone lives in `persona.md`, **outside the code path**: **Production:** a GCS object (optionally behind a short-TTL in-process cache of ≤ 60 s), edited by non-developers through a shared doc synced to the bucket or direct GCS console upload, with GCS **object versioning** for instant rollback. **Prototype:** `prompts/persona.md` re-read from disk **on every request** — edit the file mid-conversation and the very next answer changes tone. No deploy, no restart, no engineer. Persona edits trigger the §5.6 eval suite asynchronously so a CEO tone change that breaks report quality is flagged within minutes, not after a week of odd reports.
+The report tone lives in `persona.md`, **outside the code path**: **Production:** a GCS object (optionally behind a short-TTL in-process cache of ≤ 60 s), edited by non-developers through a shared doc synced to the bucket or direct GCS console upload, with GCS **object versioning** for instant rollback. **Prototype:** `prompts/persona.md` re-read from disk **on every request** and passed as the system prompt of the report's executive-summary LLM call — edit the file mid-conversation and the very next answer changes tone. No deploy, no restart, no engineer. Persona edits trigger the §5.6 eval suite asynchronously so a CEO tone change that breaks report quality is flagged within minutes, not after a week of odd reports.
 
 ## 6. Extensibility & data flow notes
 
