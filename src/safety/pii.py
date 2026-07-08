@@ -46,12 +46,15 @@ _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 
 # A phone number must carry at least one separator, a parenthesised area code,
 # or a leading country code — so a bare integer (a revenue figure, an id) is not
-# masked. Deliberately conservative on that side (ADR-003).
+# masked. Deliberately conservative on that side (ADR-003). Separators are
+# horizontal-only ([ \t], never newline) and a match may not start right after
+# "digit," / "digit." — otherwise formatted amounts in tabular report text
+# ("141,004.60\n2025-02") get bridged into phone-shaped digit runs and masked.
 _PHONE_RE = re.compile(
-    r"""(?<!\w)
-        (?:\+?\d{1,3}[\s.\-]?)?          # optional country code
-        (?:\(\d{2,4}\)[\s.\-]?|\d{2,4}[\s.\-])  # area code w/ paren or separator
-        \d{2,4}[\s.\-]?\d{2,4}
+    r"""(?<!\w)(?<!\d,)(?<!\d\.)
+        (?:\+?\d{1,3}[ \t.\-]?)?          # optional country code
+        (?:\(\d{2,4}\)[ \t.\-]?|\d{2,4}[ \t.\-])  # area code w/ paren or separator
+        \d{2,4}[ \t.\-]?\d{2,4}
         (?!\w)""",
     re.VERBOSE,
 )

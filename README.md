@@ -277,14 +277,14 @@ working slices of the rest:
 | 3 | High-Stakes Oversight (delete confirmation) | delete branch in `src/agent/graph.py` (`match_reports` → `interrupt()` → typed phrase → `execute_delete`), owner scoping + audit in `src/reports_store/store.py` | [§5.3](docs/architecture.md#53-high-stakes-oversight--destructive-report-deletion); [ADR-004](docs/decisions/004-interrupt-based-delete-confirmation.md) |
 | 4 | Continuous Improvement (learning loop) | user level: `src/tools/prefs_store.py` + `set_preference` node (`table`/`bullets` per user) | [§5.4](docs/architecture.md#54-continuous-improvement--the-learning-loop) user + system level (Pub/Sub → human curation → golden bucket) |
 | 5 | Resilience & Error Handling | `sql_repair`/`graceful_failure` nodes in `src/agent/graph.py` (max 2 retries, error context, empty-result detection), retry/backoff in `src/tools/llm.py`; REPL never crashes (`src/main.py`) | [§5.5](docs/architecture.md#55-resilience--graceful-error-handling); [ADR-005](docs/decisions/005-gemini-with-openrouter-fallback.md) (fallback provider) |
-| 6 | Quality Assurance | `tests/` (196 offline unit tests incl. adversarial suite), `evals/run_evals.py` + `evals/golden_questions.yaml` (live end-to-end property-based gate) | [§5.6](docs/architecture.md#56-quality-assurance) eval set, execution accuracy, LLM-as-judge, CI gate |
+| 6 | Quality Assurance | `tests/` (199 offline unit tests incl. adversarial suite), `evals/run_evals.py` + `evals/golden_questions.yaml` (live end-to-end property-based gate) | [§5.6](docs/architecture.md#56-quality-assurance) eval set, execution accuracy, LLM-as-judge, CI gate |
 | 7 | Observability | `src/agent/observability.py` (uniform node wrapper → one JSON line per node to `logs/agent.jsonl` with trace ID, latency, model, tokens), `--debug` flag | [§5.7](docs/architecture.md#57-observability) metrics, tracing, alerting |
 | 8 | Agility (persona management) | `load_context` node in `src/agent/graph.py` re-reads `prompts/persona.md` from disk **every turn** — edits apply to the next answer, no redeploy | [§5.8](docs/architecture.md#58-agility--persona-management-without-redeploys) |
 
 ## Tests, lint, evals
 
 ```sh
-uv run pytest                        # 196 offline unit tests (~1s, no network)
+uv run pytest                        # 199 offline unit tests (~1s, no network)
 uv run ruff check src tests evals demos scripts
 uv run mypy src                      # strict
 uv run python evals/run_evals.py     # live end-to-end eval gate (BigQuery + Gemini)

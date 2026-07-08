@@ -34,6 +34,28 @@ class TestMaskText:
         once = pii.mask_text("a@b.com and 555-123-4567")
         assert pii.mask_text(once) == once
 
+    def test_does_not_bridge_amounts_across_table_lines(self) -> None:
+        # Regression: in a rendered month/revenue table, "004.60\n2025-02" is a
+        # phone-shaped digit run — the mask must never join digits across lines.
+        table = (
+            "  month  total_revenue\n"
+            "2025-01     141,004.60\n"
+            "2025-02     143,007.91\n"
+            "2025-03     147,553.11"
+        )
+        assert pii.mask_text(table) == table
+
+    def test_does_not_mask_amount_followed_by_date_on_one_line(self) -> None:
+        # The tail of a formatted amount ("...,004.60") must not seed a match
+        # even when a date-like digit group follows on the same line.
+        text = "revenue was 141,004.60 2025-02 was stronger"
+        assert pii.mask_text(text) == text
+
+    def test_still_masks_phone_after_comma_with_space(self) -> None:
+        out = pii.mask_text("Reach Jane at, 555-123-4567.")
+        assert "555-123-4567" not in out
+        assert pii.PHONE_MASK in out
+
 
 class TestFindPiiColumns:
     def test_flags_qualified_email(self) -> None:
