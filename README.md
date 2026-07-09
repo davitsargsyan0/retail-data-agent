@@ -287,14 +287,23 @@ working slices of the rest:
 uv run pytest                        # 199 offline unit tests (~1s, no network)
 uv run ruff check src tests evals demos scripts
 uv run mypy src                      # strict
-uv run python evals/run_evals.py     # live end-to-end eval gate (BigQuery + Gemini)
+uv run python evals/run_evals.py --smoke   # live eval subset, sized for a free-tier key
+uv run python evals/run_evals.py           # full live eval gate (paid-tier / CI quota)
 ```
 
 The eval harness runs golden business questions plus adversarial probes through
 the real graph and checks property-based expectations (tables referenced,
 non-empty results, numeric sanity bands, zero surviving PII). Exit code 0 = all
 pass, 1 = quality regression, 2 = could not verify (LLM/BigQuery outage or
-free-tier quota).
+quota).
+
+**On a free-tier Gemini key, use `--smoke`.** Free keys have small per-model
+quotas (as low as 5 requests/min and 20/day); the full 13-question suite needs
+~25-30 LLM calls and cannot fit, while the `--smoke` subset (~10-12 calls,
+marked `smoke: true` in `evals/golden_questions.yaml`) covers every check type
+plus all three adversarial probes and finishes within one free budget. Analysis
+questions are paced 20s apart to respect the per-minute limit — the pauses are
+intentional; set `EVAL_PACE_SECONDS=0` on a paid-tier key.
 
 ## Layout
 

@@ -16,14 +16,20 @@ Design notes:
   This keeps a quota outage from masquerading as a wall of red FAILs.
 - Exit code: 0 = all pass, 1 = a real quality FAIL, 2 = could-not-verify only
   (infra/quota). Any nonzero blocks a deploy, but 2 tells a human it was infra.
+- Free-tier Gemini keys have small per-model quotas (observed: 5 requests/min,
+  20/day). ``--smoke`` runs the representative ``smoke: true`` subset (~10-12
+  LLM calls), and analysis questions are paced ``EVAL_PACE_SECONDS`` apart
+  (default 20; set 0 on a paid-tier key) so the per-minute limit never trips.
 
-Run with:  ``uv run python evals/run_evals.py``
+Run with:  ``uv run python evals/run_evals.py [--smoke]``
 """
 
 from __future__ import annotations
 
+import os
 import re
 import sys
+import time
 import traceback
 import uuid
 from dataclasses import dataclass, field
@@ -235,13 +241,31 @@ def _print_table(results: list[tuple[str, str, CheckResult]]) -> None:
 
 def main() -> int:
     load_dotenv(REPO_ROOT / ".env")
+    smoke = "--smoke" in sys.argv[1:]
+    pace_seconds = float(os.environ.get("EVAL_PACE_SECONDS", "20"))
     spec = yaml.safe_load(QUESTIONS_PATH.read_text(encoding="utf-8"))
+
+    def _selected(section: str) -> list[dict[str, Any]]:
+        entries = list(spec.get(section, []))
+        return [e for e in entries if e.get("smoke")] if smoke else entries
+
+    analysis_entries = _selected("analysis")
+    adversarial_entries = _selected("adversarial")
+    if smoke:
+        print(f"smoke subset: {len(analysis_entries) + len(adversarial_entries)} questions")
+    if pace_seconds:
+        print(
+            f"pacing analysis questions {pace_seconds:g}s apart for free-tier "
+            "rate limits (EVAL_PACE_SECONDS=0 to disable)"
+        )
     graph = build_graph()
 
     results: list[tuple[str, str, CheckResult]] = []
 
-    for entry in spec.get("analysis", []):
+    for index, entry in enumerate(analysis_entries):
         qid = str(entry["id"])
+        if index and pace_seconds:
+            time.sleep(pace_seconds)
         print(f"running analysis: {qid} ...", flush=True)
         try:
             run = run_question(graph, str(entry["question"]))
@@ -255,7 +279,7 @@ def main() -> int:
             traceback.print_exc()
         results.append((qid, "analysis", result))
 
-    for entry in spec.get("adversarial", []):
+    for entry in adversarial_entries:
         qid = str(entry["id"])
         print(f"running adversarial: {qid} ...", flush=True)
         try:
@@ -286,6 +310,11 @@ def main() -> int:
         print("FAILED: " + ", ".join(failed))
     if errored:
         print("COULD NOT VERIFY: " + ", ".join(errored))
+        print(
+            "Tip: free-tier Gemini keys have small per-model daily quotas — "
+            "run the sized-down subset with --smoke, or point GEMINI_MODEL at "
+            "a model with remaining quota."
+        )
 
     if failed:
         return 1  # a real quality regression — hard gate
