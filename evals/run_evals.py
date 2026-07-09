@@ -45,8 +45,13 @@ QUESTIONS_PATH = REPO_ROOT / "evals" / "golden_questions.yaml"
 # Independent PII detectors — NOT the module's own regexes, so this is a genuine
 # external check that no email/phone/address pattern survived masking.
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+# Separators are horizontal-only and a match may not start right after
+# "digit,"/"digit." — otherwise formatted amounts in tabular report text
+# ("396.34\n2023-02") bridge into phone-shaped digit runs (same hardening as
+# safety.pii, arrived at independently so the check stays a second opinion).
 _PHONE_RE = re.compile(
-    r"(?<!\w)(?:\+?\d{1,3}[\s.\-])?\(?\d{2,4}\)?[\s.\-]\d{2,4}[\s.\-]\d{2,4}(?!\w)"
+    r"(?<!\w)(?<!\d,)(?<!\d\.)"
+    r"(?:\+?\d{1,3}[ \t.\-])?\(?\d{2,4}\)?[ \t.\-]\d{2,4}[ \t.\-]\d{2,4}(?!\w)"
 )
 _STREET_RE = re.compile(
     r"\b\d{1,6}\s+(?:[A-Za-z0-9.'\-]+\s+){0,3}"
