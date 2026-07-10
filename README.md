@@ -281,6 +281,29 @@ working slices of the rest:
 | 7 | Observability | `src/agent/observability.py` (uniform node wrapper → one JSON line per node to `logs/agent.jsonl` with trace ID, latency, model, tokens), `--debug` flag | [§5.7](docs/architecture.md#57-observability) metrics, tracing, alerting |
 | 8 | Agility (persona management) | `load_context` node in `src/agent/graph.py` re-reads `prompts/persona.md` from disk **every turn** — edits apply to the next answer, no redeploy | [§5.8](docs/architecture.md#58-agility--persona-management-without-redeploys) |
 
+## Known limitations & design choices
+
+Two behaviors a reviewer may notice are deliberate scope decisions, not bugs:
+
+- **Each question is independent — no multi-turn memory in the prototype.**
+  Every CLI turn runs on a fresh checkpointed thread, so a follow-up like
+  *"and how does that compare to 2024?"* won't resolve "that". The state schema
+  and checkpointer are built for conversation (that is how the delete
+  confirmation pauses and resumes), and the production design keeps
+  conversation state in a Firestore-backed checkpointer keyed by
+  `conversation_id` ([architecture §3](docs/architecture.md#3-request-lifecycle--langgraph-node-flow));
+  wiring history into the prompts was cut from the prototype to keep it small.
+  Ask self-contained questions.
+
+- **Any request naming the `users` table is refused — deliberately.** The
+  intent gate fails closed on the one table that holds PII, so *"what columns
+  are in the users table?"* gets a polite refusal even though it is innocent.
+  General structure questions (*"what tables do we have and what columns are
+  in them?"*) work fine. Over-refusing on the PII-bearing table is the chosen
+  trade-off: a miss here costs a rephrase; a miss in the other direction is a
+  data leak (defense-in-depth rationale in
+  [ADR-003](docs/decisions/003-pii-defense-in-depth.md)).
+
 ## Tests, lint, evals
 
 ```sh
