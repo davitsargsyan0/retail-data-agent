@@ -105,6 +105,7 @@ class QuestionRun:
     rows: list[dict[str, Any]] | None = None
     final: str = ""
     intent: str | None = None
+    intent_reason: str = ""
     interrupted: bool = False
     node_errors: list[str] = field(default_factory=list)
 
@@ -151,6 +152,8 @@ def run_question(graph: Any, question: str) -> QuestionRun:
                 run.sql = str(update["sql"])
             if update.get("intent"):
                 run.intent = str(update["intent"])
+            if update.get("intent_reason"):
+                run.intent_reason = str(update["intent_reason"])
             if update.get("result_rows") is not None:
                 run.rows = list(update["result_rows"])
             if update.get("final_response"):
@@ -164,14 +167,21 @@ def _infra_reason(run: QuestionRun, qtype: str) -> str | None:
     """Return why this run couldn't be verified (infra/quota), else None.
 
     Two signals: (1) a node surfaced an LLM/BigQuery outage in ``sql_error``, or
-    (2) a golden *analysis* question fail-closed to a refusal with no SQL — the
-    intent gate never reached the analysis pipeline, which for a known-good
-    business question means the LLM was down (e.g. quota), not a wrong answer.
+    (2) a golden *analysis* question fail-closed to a refusal because the intent
+    gate reported its classifier unavailable (quota/outage). A refusal where the
+    classifier *did* answer is a genuine misroute and must count as FAIL, not
+    infra — this distinction caught a real routing bug that a blanket
+    refusal-means-outage heuristic had been masking.
     """
     for err in run.node_errors:
         if _is_infra_error(err):
             return "LLM/BigQuery unavailable"
-    if qtype == "analysis" and run.sql is None and run.intent == "refuse":
+    if (
+        qtype == "analysis"
+        and run.sql is None
+        and run.intent == "refuse"
+        and "unavailable" in run.intent_reason
+    ):
         return "analysis fail-closed to refusal (LLM/quota outage)"
     return None
 
